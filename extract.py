@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 
 import anthropic
 
-_client = None
+_client = anthropic.Anthropic()
 
 
 def _get_client():
