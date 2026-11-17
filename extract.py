@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import re
@@ -5,7 +6,7 @@ from datetime import date, datetime, timedelta
 
 import anthropic
 
-_client = anthropic.Anthropic()
+_client = None
 
 
 def _get_client():
@@ -15,7 +16,105 @@ def _get_client():
         _client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
     return _client
 
-MODEL = "claude-sonnet-5-5"
+DEFAULT_MODEL = "claude-sonnet-5-5"
+
+
+def model_name():
+    """Which Claude model to use. Set AI_MODEL in .env to change it (e.g. claude-haiku-5-5)."""
+    return os.getenv("AI_MODEL", "").strip() or DEFAULT_MODEL
+
+
+def _request_extras(model):
+    """Settings that keep the model's 'thinking' small, since splitting a message is a simple job.
+    Thinking tokens are billed as output tokens. AI_EFFORT in .env can be low (default), medium or high.
+    Only models checked against Anthropic's docs get extras; any other model uses its defaults."""
+    effort = os.getenv("AI_EFFORT", "").strip().lower()
+    if effort not in ("low", "medium", "high"):
+        effort = "low"
+    if model == "claude-sonnet-5-5":
+        return {"thinking": {"type": "between_tools"}, "output_config": {"effort": effort}}
+    if model == "claude-haiku-5-5":
+        return {"thinking": {"type": "disabled"}, "output_config": {"effort": effort}}
+    if model == "claude-opus-5-5":
+        return {"output_config": {"effort": effort}}
+    return None
+
+
+def _reply_text(response):
+    """The answer text. Skips 'thinking' blocks (they have no .text), so we read blocks by type."""
+    return "".join(b.text for b in response.content
+                   if getattr(b, "type", "text") == "text" and hasattr(b, "text"))
+
+
+def _call_api(model, system, message):
+    kwargs = dict(model=model, max_tokens=8000, system=system,
+                  messages=[{"role": "user", "content": message}])
+    extras = _request_extras(model)
+    if extras:
+        try:
+            return _get_client().messages.create(**kwargs, extra_body=extras)
+        except anthropic.BadRequestError:
+            pass  # the low-thinking settings were refused: try again with the model's defaults
+    return _get_client().messages.create(**kwargs)
+
+
+# USD per 1 million tokens: (input, output).
+# Source: platform.claude.com/docs/en/about-claude/pricing - check there if prices change.
+# (Haiku 5.5 costs more only for prompts over 100,000 tokens, which this app never sends.)
+PRICES = {
+    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-opus-5-5": (4.00, 20.00),
+}
+
+
+def _cost(model, input_tokens, output_tokens):
+    """Dollar cost of one call, or None if this model's price is not in PRICES."""
+    if model not in PRICES:
+        return None
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+
+def _usage_log_path():
+    return os.getenv("USAGE_LOG", "ai_usage_log.csv")
+
+
+def _log_usage(usage, message_chars):
+    """Append one row to the usage log. Never stores the message text, and never breaks the app."""
+    if not usage or not usage["calls"]:
+        return
+    try:
+        path = _usage_log_path()
+        new_file = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["time", "model", "calls", "input_tokens", "output_tokens", "cost_usd", "message_chars"])
+            cost = usage.get("cost_usd")
+            w.writerow([datetime.now().isoformat(timespec="seconds"), usage["model"], usage["calls"],
+                        usage["input_tokens"], usage["output_tokens"],
+                        "" if cost is None else f"{cost:.6f}", message_chars])
+    except OSError:
+        pass
+
+
+def usage_summary():
+    """Totals from the usage log, or None if nothing has been logged yet."""
+    try:
+        with open(_usage_log_path(), newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except OSError:
+        return None
+    if not rows:
+        return None
+    costs = [float(r["cost_usd"]) for r in rows if r.get("cost_usd")]
+    return {
+        "messages": len(rows),
+        "input_tokens": sum(int(r["input_tokens"]) for r in rows),
+        "output_tokens": sum(int(r["output_tokens"]) for r in rows),
+        "cost_usd": sum(costs) if costs else None,
+    }
 
 SYSTEM_TEMPLATE = """You turn messages from staff at a Malaysian corporate services firm into a list of Company Secretarial (CoSec) task records.
 
@@ -266,20 +365,32 @@ def _demo_extract(message, categories, today_text):
 
 def extract_tasks(message, categories, companies, today):
     if demo_mode():
-        return _clean(_demo_extract(message, categories, today), categories)
+        result = _clean(_demo_extract(message, categories, today), categories)
+        result["usage"] = None          # demo mode makes no AI call, so it costs nothing
+        return result
+
     system = _build_system(categories, companies, today)
+    model = model_name()
+    usage = {"model": model, "calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": None}
     last_error = None
-    for _ in range(2):  # one retry if the AI's answer can't be read
-        response = _get_client().messages.create(
-            model=MODEL,
-            max_tokens=4000,
-            system=system,
-            messages=[{"role": "user", "content": message}],
-        )
-        if response.stop_reason == "max_tokens":
-            raise ValueError("The message is too long to process in one go. Please split it into smaller parts.")
-        try:
-            return _clean(_parse_json(response.content[0].text), categories)
-        except ValueError as e:  # includes json.JSONDecodeError
-            last_error = e
-    raise ValueError(f"Could not read the AI's answer: {last_error}")
+    try:
+        for _ in range(2):  # one retry if the AI's answer can't be read
+            response = _call_api(model, system, message)
+            # Every call is paid for, so count its tokens even if the answer turns out unusable.
+            usage["calls"] += 1
+            usage["input_tokens"] += getattr(response.usage, "input_tokens", 0) or 0
+            usage["output_tokens"] += getattr(response.usage, "output_tokens", 0) or 0
+            usage["cost_usd"] = _cost(model, usage["input_tokens"], usage["output_tokens"])
+
+            if response.stop_reason == "max_tokens":
+                raise ValueError("The message is too long to process in one go. Please split it into smaller parts.")
+            try:
+                result = _clean(_parse_json(_reply_text(response)), categories)
+            except ValueError as e:  # includes json.JSONDecodeError
+                last_error = e
+                continue
+            result["usage"] = usage
+            return result
+        raise ValueError(f"Could not read the AI's answer: {last_error}")
+    finally:
+        _log_usage(usage, len(message))
