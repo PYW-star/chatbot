@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-=======
 import csv
->>>>>>> extract-changes
 import json
 import os
 import re
