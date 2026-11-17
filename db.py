@@ -18,8 +18,8 @@ def _connect():
         dbname=os.getenv("DB_NAME", "cosec_tasks"),
         user=os.environ["DB_USER"],
         password=os.environ["DB_PASSWORD"],
-        connect_timeout=5,
-        options="-c timezone=Asia/Kuala_Lumpur",  # show times in Malaysia time
+        sslmode=os.getenv("DB_SSLMODE", "prefer"),  # hosted databases (e.g. Neon) need "require"
+        connect_timeout=10,                          # a sleeping hosted database can take a few seconds to wake
     )
 
 
@@ -30,6 +30,7 @@ def get_cursor():
     try:
         with conn:  # commit on success, rollback on any exception
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SET LOCAL TIME ZONE 'Asia/Kuala_Lumpur'")  # show times in Malaysia time
                 yield cur
     finally:
         conn.close()
@@ -104,15 +105,16 @@ def _norm(name):
     return re.sub(r"\s+", " ", n).strip()
 
 
-def match_company(name, threshold=0.85):
-    """Return the existing company name that closely matches, else the name as typed."""
+def match_company(name, threshold=0.85, existing=None):
+    """Return the saved company name that closely matches, else the name as typed.
+    `existing` lets a test pass its own list instead of reading the database."""
     if not name:
         return name
     best, best_score = None, 0.0
-    for existing in get_companies():
-        score = difflib.SequenceMatcher(None, _norm(name), _norm(existing)).ratio()
+    for candidate in (existing if existing is not None else get_companies()):
+        score = difflib.SequenceMatcher(None, _norm(name), _norm(candidate)).ratio()
         if score > best_score:
-            best, best_score = existing, score
+            best, best_score = candidate, score
     return best if best and best_score >= threshold else name
 
 
