@@ -27,3 +27,12 @@ The app uses `CoSec_Task_Management.xlsx` in this folder by default. You can set
 ## Optional fees
 
 During **Review before saving**, enter an amount in **Fee (RM) — optional**, or leave it empty to store a truly blank Excel cell. `0` is different from blank. AI/demo extraction attempts to detect explicit RM amounts, but check the amount before saving. The Excel `Tasks` sheet has a new `fee_amount` column. Existing workbooks using the previous schema are upgraded automatically on startup without deleting records; back them up first. Fees are not automatically marked as paid/collected.
+
+## Date Received correction (Nov 2026)
+
+- The app passes the current date in Malaysia's `Asia/Kuala_Lumpur` timezone to the extractor.
+- Demo mode only extracts dates explicitly associated with receiving the instruction (e.g. `received today`, `received 18/11/2026`). A deadline, filing date, effective date, or meeting date is **not** a received date.
+- If no received date is stated, the review table leaves it blank. Enter the real received date in `YYYY-MM-DD` format before saving.
+- Numeric dates in demo mode follow Malaysian `DD/MM/YYYY` convention.
+- Date regression tests: `python test_dates.py`. These tests do not modify Excel records.
+- Live AI's contextual date interpretation has **not** been verified; review dates before saving.

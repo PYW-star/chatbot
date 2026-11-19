@@ -1,4 +1,5 @@
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -124,7 +125,7 @@ with tab_chat:
         st.session_state.chat.append(("user", message))
         try:
             result = extract.extract_tasks(
-                message, db.get_categories(), db.get_companies(), date.today().isoformat()
+                message, db.get_categories(), db.get_companies(), datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).date().isoformat()
             )
         except Exception as e:
             st.session_state.chat.append(("assistant", f"Sorry, extraction failed: {e}"))
@@ -172,6 +173,7 @@ with tab_chat:
         df = pd.DataFrame(tasks).reindex(columns=COLUMNS)
         df = df.astype(object).where(df.notna(), "")
 
+        st.caption("Date Received must be YYYY-MM-DD. It means when the instruction arrived, NOT its deadline. If missing, check the original email and enter the correct date before saving.")
         st.caption("Fee (RM) is optional. Leave it blank if the amount is unknown; 0 means explicitly no fee.")
 
         edited = st.data_editor(
