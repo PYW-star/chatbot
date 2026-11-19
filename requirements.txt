@@ -3,3 +3,5 @@ anthropic
 pandas
 psycopg2-binary
 python-dotenv
+openpyxl
+filelock

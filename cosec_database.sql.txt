@@ -1,3 +1,5 @@
+-- Pivot to excel sheets, database sql not in use rn
+
 -- Permission and role setup
 
 CREATE ROLE cosec_admin LOGIN PASSWORD 'anything_change_it_a';
@@ -38,6 +40,7 @@ CREATE TABLE TASK (
     category_id     INT NOT NULL,
     date_received   DATE NOT NULL,
     raw_message     TEXT NOT NULL,
+    fee_cost        INT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by      VARCHAR(50) NOT NULL,
 

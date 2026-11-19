@@ -2,7 +2,7 @@ from datetime import date
 
 from dotenv import load_dotenv
 
-load_dotenv(override=True)  # reads DB_* and ANTHROPIC_API_KEY from the .env file, if there is one
+load_dotenv(override=True)  # reads COSEC_EXCEL_PATH and ANTHROPIC_API_KEY if configured
 
 import pandas as pd
 import streamlit as st
@@ -12,17 +12,17 @@ import extract
 
 st.set_page_config(page_title="CoSec Task Log", layout="wide")
 
-# Stop early with a clear message if the database can't be reached.
+# Stop early with a clear message if the workbook cannot be opened.
 try:
     db.check_connection()
 except Exception as e:
     st.error(
-        "Cannot connect to the database. Check the DB_* settings in your .env file "
-        f"and that PostgreSQL is running.\n\nDetails: {e}"
+        "Cannot open the local Excel workbook. Check that the file is not open in Excel and that its folder is writable. "
+        f"\n\nDetails: {e}"
     )
     st.stop()
 
-FIELDS = ["company", "category", "date_received"]
+FIELDS = ["company", "category", "date_received", "fee_amount"]
 COLUMNS = FIELDS + ["source_text"]   # source_text is only shown, never saved
 
 
@@ -33,7 +33,7 @@ def clean(value):
     return str(value).strip() or None
 
 
-LABELS = {"company": "Company", "category": "Category", "date_received": "Date received"}
+LABELS = {"company": "Company", "category": "Category", "date_received": "Date received", "fee_amount": "Fee (RM)"}
 ACTION_STYLE = {
     "CREATE": ":green-background[ CREATE ]",
     "UPDATE": ":orange-background[ UPDATE ]",
@@ -74,6 +74,10 @@ def show_task(task_id):
         ]:
             col.caption(title)
             col.markdown(f"**{esc(val)}**")
+        col_fee, = st.columns(1)
+        col_fee.caption("Fee (RM)")
+        fee = task.get("fee_amount")
+        col_fee.markdown(f"**{'Not specified' if fee is None else f'RM {fee:,.2f}'}**")
         with st.expander("Original message"):
             st.text(task["raw_message"])
 
@@ -97,6 +101,7 @@ st.session_state.setdefault("pending_id", 0)
 
 # ---------- sidebar ----------
 st.sidebar.title("CoSec Task Log")
+st.sidebar.caption(f"Local Excel: {db.FILE}")
 user = st.sidebar.text_input("Your name (saved as 'uploaded by')")
 if extract.demo_mode():
     st.sidebar.warning(
@@ -167,25 +172,49 @@ with tab_chat:
         df = pd.DataFrame(tasks).reindex(columns=COLUMNS)
         df = df.astype(object).where(df.notna(), "")
 
+        st.caption("Fee (RM) is optional. Leave it blank if the amount is unknown; 0 means explicitly no fee.")
+
         edited = st.data_editor(
             df,
             key=f"editor_{st.session_state.pending_id}",
             num_rows="dynamic",
             disabled=["source_text"],
             column_config={
-                "source_text": st.column_config.TextColumn("from message"),
+                "company": st.column_config.TextColumn(
+                    "Company Name"
+                ),
+                "date_received": st.column_config.TextColumn(
+                    "Date Received",
+                ),
+                "source_text": st.column_config.TextColumn(
+                    "Original Message"
+                ),
+                "fee_amount": st.column_config.NumberColumn(
+                    "Fee (RM)",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    required=False
+                ),
                 "category": st.column_config.SelectboxColumn(
-                    "category", options=db.get_categories()
+                    "Task Category",
+                    options=db.get_categories()
                 ),
             },
         )
 
+
         col1, col2 = st.columns(2)
-        if col1.button("Save to database", type="primary"):
+        if col1.button("Save to Excel", type="primary"):
             if not user.strip():
                 st.error("Enter your name in the sidebar first (saved as 'uploaded by').")
             else:
-                rows = [{k: clean(v) for k, v in r.items()} for r in edited.to_dict("records")]
+                rows = []
+                for r in edited.to_dict("records"):
+                    item = {k: clean(v) for k, v in r.items() if k != "fee_amount"}
+                    fee = r.get("fee_amount")
+                    item["fee_amount"] = None if fee is None or pd.isna(fee) or str(fee).strip() == "" else fee
+                    rows.append(item)
                 bad = [i + 1 for i, r in enumerate(rows)
                        if not (r.get("company") and r.get("category") and r.get("date_received"))]
                 if bad:
