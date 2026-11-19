@@ -35,7 +35,7 @@ def clean(value):
     return str(value).strip() or None
 
 
-LABELS = {"company": "Company", "category": "Category", "date_received": "Date received", "fee_amount": "Fee (RM)"}
+LABELS = {"company": "Company", "category": "Category", "date_received": "Date received", "fee_amount": "Fee (RM)", "status": "Status", "update_note": "Update note"}
 ACTION_STYLE = {
     "CREATE": ":green-background[ CREATE ]",
     "UPDATE": ":orange-background[ UPDATE ]",
@@ -76,6 +76,7 @@ def show_task(task_id):
         ]:
             col.caption(title)
             col.markdown(f"**{esc(val)}**")
+        st.caption(f"Status: {task.get('status', 'Pending')}")
         col_fee, = st.columns(1)
         col_fee.caption("Fee (RM)")
         fee = task.get("fee_amount")
@@ -112,7 +113,7 @@ if extract.demo_mode():
         "ANTHROPIC_API_KEY in .env and set DEMO_MODE=false."
     )
 
-tab_chat, tab_records = st.tabs(["Chatbox", "Records"])
+tab_chat, tab_update, tab_records = st.tabs(["Add Tasks", "Update Tasks", "Records"])
 
 # ---------- chatbox ----------
 with tab_chat:
@@ -305,17 +306,118 @@ with tab_chat:
             st.session_state.pending = None
             st.rerun()
 
+# ---------- update an existing task ----------
+with tab_update:
+    st.subheader("Update an existing task")
+    st.caption("Search by task ID, company, or category. Any employee can update a task. Changes are saved to Excel and recorded in the audit log.")
+    task_options = db.list_tasks()
+    if not task_options:
+        st.info("There are no tasks to update yet. Add a task first.")
+    else:
+        lookup = {r["task_id"]: r for r in task_options}
+        selected_id = st.selectbox(
+            "Search for a task",
+            options=list(lookup),
+            format_func=lambda tid: f"{tid}  ·  {lookup[tid]['company']}  ·  {lookup[tid]['category']}  ·  {lookup[tid]['status']}",
+            index=None,
+            placeholder="Type task ID, company, or category...",
+            key="update_task_selection",
+        )
+        if selected_id:
+            current = db.get_task(selected_id)
+            # Store the initial snapshot until the user switches task or saves.
+            if st.session_state.get("update_snapshot_id") != selected_id:
+                st.session_state.update_snapshot_id = selected_id
+                st.session_state.update_snapshot = {k: current[k] for k in ("company", "category", "date_received", "fee_amount", "status")}
+            snapshot = st.session_state.update_snapshot
+            st.caption(f"Task ID: {selected_id} · Created by {current['created_by']} on {current['created_at']:%d %b %Y}")
+            with st.expander("Original instruction"):
+                st.text(current["raw_message"])
+            companies = db.get_companies()
+            categories = db.get_categories()
+            with st.form(f"task_update_form_{selected_id}"):
+                left, right = st.columns(2)
+                with left:
+                    status = st.selectbox("Status", db.TASK_STATUSES, index=db.TASK_STATUSES.index(snapshot["status"]))
+                    company = st.selectbox("Company", companies, index=companies.index(snapshot["company"]))
+                    date_received = st.date_input("Date received (not deadline)", value=snapshot["date_received"])
+                with right:
+                    category = st.selectbox("Task category", categories, index=categories.index(snapshot["category"]))
+                    original_fee = snapshot["fee_amount"]
+                    fee_value = st.text_input("Fee (RM) — blank if unknown", value="" if original_fee is None else str(original_fee))
+                    note = st.text_area("Update note (optional)", placeholder="E.g. Signed documents received; preparing SSM filing", max_chars=2000)
+                submitted = st.form_submit_button("Save update to Excel", type="primary")
+            if submitted:
+                if not user.strip():
+                    st.error("Enter your name in the sidebar before updating.")
+                else:
+                    try:
+                        entry = db.update_task(
+                            selected_id,
+                            {"status": status, "company": company, "category": category,
+                             "date_received": date_received, "fee_amount": fee_value},
+                            user.strip(), note=note, expected=snapshot,
+                        )
+                    except Exception as exc:
+                        st.error(f"Could not update task: {exc}")
+                    else:
+                        st.success(f"Task {selected_id} updated. Audit entry #{entry} saved.")
+                        st.session_state.pop("update_snapshot_id", None)
+                        st.session_state.pop("update_snapshot", None)
+                        st.rerun()
+            with st.expander("View audit history for this task"):
+                for event in db.get_audit(selected_id):
+                    st.markdown(f"**{event['action_type']}** · {event['audited_by']} · {event['audited_at']:%d %b %Y, %I:%M %p}")
+                    show_changes(event["old_value"], event["new_value"])
+
 # ---------- records ----------
+
 with tab_records:
     companies = db.get_companies()
     choice = st.selectbox("Company", ["All companies"] + companies)
-    rows = db.list_tasks(None if choice == "All companies" else choice)
+
+    rows = db.list_tasks(
+        None if choice == "All companies" else choice
+    )
+
+    # Remove empty/invalid records
+    rows = [
+        r for r in rows
+        if r.get("task_id") is not None
+        and str(r["task_id"]).strip().lower() not in ("", "none", "null")
+    ]
+
     st.caption(f"{len(rows)} record(s)")
+
     if rows:
-        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        df = pd.DataFrame(rows)
+
+        # Hide the status column
+        df = df.drop(columns=["status"], errors="ignore")
+
+        # Show only the latest 50 records
+        st.dataframe(
+            df.head(50),
+            hide_index=True,
+            use_container_width=True
+        )
 
         st.divider()
-        labels = {r["task_id"]: f'{r["task_id"]}  ·  {r["company"]}  ·  {r["category"]}' for r in rows}
-        chosen = st.selectbox("Open a task to see its details and audit trail",
-                              list(labels), format_func=labels.get)
+
+        # Select any valid task to view its audit trail
+        labels = {
+            r["task_id"]:
+                f'{r["task_id"]}  ·  {r["company"]}  ·  {r["category"]}'
+            for r in rows
+        }
+
+        chosen = st.selectbox(
+            "Open a task to see its details and audit trail",
+            list(labels),
+            format_func=labels.get
+        )
+
         show_task(chosen)
+
+    else:
+        st.info("No tasks found.")
