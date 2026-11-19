@@ -206,60 +206,203 @@ def _optional_fee(value):
     return float(number)
 
 
-def insert_tasks(tasks, raw_message, user):
-    """Save all tasks atomically; validation failure leaves workbook unchanged."""
+
+def insert_tasks(tasks, raw_message, user, approve_new_companies=False, approve_new_categories=False,):
+    """Save tasks atomically, requiring approval for new companies/categories."""
+
     if not str(user).strip():
         raise ValueError("Uploader name is required.")
+
     with _book(write=True) as wb:
-        cats = {str(r["category_name"]).casefold():r for r in _rows(wb["Categories"])}
-        existing_companies = {str(r["company_name"]).casefold():r for r in _rows(wb["Companies"])}
-        counters = {str(r["counter_date"])[:10]:int(r["last_no"]) for r in _rows(wb["Task_Counter"])}
-        new_companies, created = {}, []
+        cats = {
+            str(r["category_name"]).strip().casefold(): r
+            for r in _rows(wb["Categories"])
+        }
+
+        existing_companies = {
+            str(r["company_name"]).strip().casefold(): r
+            for r in _rows(wb["Companies"])
+        }
+
+        counters = {
+            str(r["counter_date"])[:10]: int(r["last_no"])
+            for r in _rows(wb["Task_Counter"])
+        }
+
+        new_companies = {}
+        new_categories = {}
+        created = []
         staged = []
+
+        company_ids = [
+            int(r["company_id"])
+            for r in existing_companies.values()
+        ]
+
+        category_ids = [
+            int(r["category_id"])
+            for r in cats.values()
+        ]
+
+        next_company_id = max(company_ids, default=0)
+        next_category_id = max(category_ids, default=0)
+
+        # Validate and prepare all tasks before changing workbook sheets.
         for t in tasks:
             name = str(t.get("company") or "").strip()
             category = str(t.get("category") or "").strip()
+
             if not name:
                 raise ValueError("Company is required.")
+
             if not category:
-                raise ValueError(f"Category is required (company: {name}).")
-            cat = cats.get(category.casefold())
-            if not cat:
-                raise ValueError(f"Unknown category '{category}'. Pick one from the list.")
-            received = _to_date(t.get("date_received"), "date_received")
-            fee_amount = _optional_fee(t.get("fee_amount"))
-            key = received.isoformat()
-            next_no = counters.get(key,0)+1
-            if next_no > 999:
-                raise ValueError(f"More than 999 tasks for {key}: task ID limit reached.")
-            counters[key] = next_no
-            comp = existing_companies.get(name.casefold()) or new_companies.get(name.casefold())
+                raise ValueError(
+                    f"Category is required (company: {name})."
+                )
+
+            # -------------------------------
+            # COMPANY CONFIRMATION
+            # -------------------------------
+            company_key = name.casefold()
+
+            comp = (
+                existing_companies.get(company_key)
+                or new_companies.get(company_key)
+            )
+
             if comp is None:
-                # Original app automatically registers a company when a task is saved.
-                next_company_id = len(existing_companies)+len(new_companies)+1
-                # Use max ID to preserve uniqueness if users removed spreadsheet rows.
-                ids = [int(r["company_id"]) for r in list(existing_companies.values())+list(new_companies.values())]
-                next_company_id = max(ids,default=0)+1
-                comp = {"company_id":next_company_id,"company_name":name}
-                new_companies[name.casefold()] = comp
+                if not approve_new_companies:
+                    raise ValueError(
+                        f"Company '{name}' is not in the company list. "
+                        "Please approve adding this company before saving."
+                    )
+
+                next_company_id += 1
+
+                comp = {
+                    "company_id": next_company_id,
+                    "company_name": name,
+                }
+
+                new_companies[company_key] = comp
+
+            # -------------------------------
+            # CATEGORY CONFIRMATION
+            # -------------------------------
+            category_key = category.casefold()
+
+            cat = (
+                cats.get(category_key)
+                or new_categories.get(category_key)
+            )
+
+            if cat is None:
+                if not approve_new_categories:
+                    raise ValueError(
+                        f"Category '{category}' is not in the category list. "
+                        "Please approve adding this category before saving."
+                    )
+
+                next_category_id += 1
+
+                cat = {
+                    "category_id": next_category_id,
+                    "category_name": category,
+                }
+
+                new_categories[category_key] = cat
+
+            # -------------------------------
+            # TASK VALIDATION
+            # -------------------------------
+            received = _to_date(
+                t.get("date_received"),
+                "date_received"
+            )
+
+            fee_amount = _optional_fee(t.get("fee_amount"))
+
+            key = received.isoformat()
+            next_no = counters.get(key, 0) + 1
+
+            if next_no > 999:
+                raise ValueError(
+                    f"More than 999 tasks for {key}: task ID limit reached."
+                )
+
+            counters[key] = next_no
+
             tid = f"T{received:%y%m%d}{next_no:03d}"
+
             created.append(tid)
-            staged.append((tid,comp,cat,received,fee_amount))
-        now = datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).replace(tzinfo=None)
+            staged.append(
+                (tid, comp, cat, received, fee_amount)
+            )
+
+        # -------------------------------
+        # WRITE TO EXCEL
+        # -------------------------------
+        now = datetime.now(
+            ZoneInfo("Asia/Kuala_Lumpur")
+        ).replace(tzinfo=None)
+
+        # Add approved companies.
         for comp in new_companies.values():
-            wb["Companies"].append([comp["company_id"], _safe(comp["company_name"]), now])
-        for tid,comp,cat,received,fee_amount in staged:
-            wb["Tasks"].append([tid, comp["company_id"], cat["category_id"], received,
-                                _safe(raw_message), _safe(user.strip()), now, fee_amount])
-            wb["Tasks"].cell(wb["Tasks"].max_row, 8).number_format = '"RM "#,##0.00' 
-            snapshot = {"company":comp["company_name"], "category":cat["category_name"],
-                        "date_received":received.isoformat(), "fee_amount":fee_amount}
-            wb["Audit_Log"].append([tid,"A"+tid[1:],1,"CREATE",None,
-                                    json.dumps(snapshot,ensure_ascii=False),_safe(user.strip()),now])
-        # Rewrite counter sheet in memory; no disk change until all stages succeed.
-        ws=wb["Task_Counter"]
+            wb["Companies"].append([
+                comp["company_id"],
+                _safe(comp["company_name"]),
+                now
+            ])
+
+        # Add approved categories.
+        for cat in new_categories.values():
+            wb["Categories"].append([
+                cat["category_id"],
+                _safe(cat["category_name"]),
+            ])
+
+        # Add tasks and audit logs.
+        for tid, comp, cat, received, fee_amount in staged:
+            wb["Tasks"].append([
+                tid,
+                comp["company_id"],
+                cat["category_id"],
+                received,
+                _safe(raw_message),
+                _safe(user.strip()),
+                now,
+                fee_amount,
+            ])
+
+            wb["Tasks"].cell(
+                wb["Tasks"].max_row, 8
+            ).number_format = '"RM "#,##0.00'
+
+            snapshot = {
+                "company": comp["company_name"],
+                "category": cat["category_name"],
+                "date_received": received.isoformat(),
+                "fee_amount": fee_amount,
+            }
+
+            wb["Audit_Log"].append([
+                tid,
+                "A" + tid[1:],
+                1,
+                "CREATE",
+                None,
+                json.dumps(snapshot, ensure_ascii=False),
+                _safe(user.strip()),
+                now,
+            ])
+
+        # Update task counter.
+        ws = wb["Task_Counter"]
+
         if ws.max_row > 1:
-            ws.delete_rows(2, ws.max_row-1)
-        for d,n in sorted(counters.items()):
-            ws.append([d,n])
+            ws.delete_rows(2, ws.max_row - 1)
+
+        for d, n in sorted(counters.items()):
+            ws.append([d, n])
+
         return created
