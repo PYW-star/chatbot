@@ -36,3 +36,14 @@ During **Review before saving**, enter an amount in **Fee (RM) — optional**, o
 - Numeric dates in demo mode follow Malaysian `DD/MM/YYYY` convention.
 - Date regression tests: `python test_dates.py`. These tests do not modify Excel records.
 - Live AI's contextual date interpretation has **not** been verified; review dates before saving.
+
+## Company/category review (new)
+
+The `Companies` sheet comes with the 276 names from the supplied company directory. After extraction, the confirmation editor checks entered names against approved companies and task categories. A warning appears for every unfamiliar company or category; the person recording must tick the corresponding checkbox to allow adding it. Nothing is silently registered. The user can choose an existing category or type a proposed new one. New entries and their task are saved in one workbook operation, preserving the audit record.
+
+**Security:** The checkbox is recorder approval only. If owner-only approval is required, implement authenticated role-based review, not a text username field. Demo Mode has simple keyword heuristics, including a few example category suggestions, but is not equivalent to AI.
+
+**Tests:** `python test_company_category_review.py` runs four offline storage checks on a temporary workbook. `COMPANY_CATEGORY_TEST_CASES.md` contains ten email scenarios to test in Streamlit. To avoid changing existing live data, point `COSEC_EXCEL_PATH` at a copy of the workbook when performing manual tests.
+
+### 'Others' category approval (new)
+If extraction returns **Others**, the review UI now explicitly asks the recorder to choose **Keep Others** or **Add new category**. A new category name can be edited and then must be approved using the normal category-confirmation checkbox before saving. An unrecognised company also requires an explicit confirmation checkbox. Only a confirmed save updates the Companies/Categories sheets. This is recorder confirmation, **not** an authenticated owner-only approval.

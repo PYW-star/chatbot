@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)  # reads COSEC_EXCEL_PATH and ANTHROPIC_API_KEY if configured
 
 import pandas as pd
+import re
 import streamlit as st
 
 import db
@@ -142,10 +143,13 @@ with tab_chat:
             if result.get("intent") == "update":
                 st.session_state.chat.append(
                     ("assistant", "This looks like an update to an existing task. "
-                                  "Updates are not built yet, so I will treat it as a new task for now.")
+                                  "Updates are not built yet. Do not save this as a new task unless it is genuinely new.")
                 )
             for t in tasks:
-                t["company"] = db.match_company(t.get("company"))
+                # Do not automatically merge fuzzy matches of legally distinct entities.
+                candidate = db.match_company(t.get("company"))
+                if candidate and t.get("company") and candidate.casefold() == t["company"].casefold():
+                    t["company"] = candidate
             st.session_state.pending = tasks
             st.session_state.pending_raw = message
             st.session_state.pending_id += 1
@@ -171,6 +175,9 @@ with tab_chat:
             st.warning("Could not find: " + ", ".join(missing) + ". Please fill in or confirm.")
 
         df = pd.DataFrame(tasks).reindex(columns=COLUMNS)
+        for i, task in enumerate(tasks):
+            if not df.at[i, "category"] and task.get("suggested_category"):
+                df.at[i, "category"] = task["suggested_category"]
         df = df.astype(object).where(df.notna(), "")
 
         st.caption("Date Received must be YYYY-MM-DD. It means when the instruction arrived, NOT its deadline. If missing, check the original email and enter the correct date before saving.")
@@ -198,13 +205,63 @@ with tab_chat:
                     format="%.2f",
                     required=False
                 ),
-                "category": st.column_config.SelectboxColumn(
-                    "Task Category",
-                    options=db.get_categories()
+                "category": st.column_config.TextColumn(
+                    "Task Category (editable — use existing or suggest a new one)",
                 ),
             },
         )
 
+
+        # An AI fallback to Others must always prompt for a human choice.
+        # Keep this distinct from suggesting a genuinely unrecognised category.
+        current_rows = edited.to_dict("records")
+        unresolved_others = []
+        for i, row in enumerate(current_rows):
+            if str(row.get("category") or "").strip().casefold() != "others":
+                continue
+            suggestion = tasks[i].get("suggested_category") if i < len(tasks) else None
+            st.warning(f"⚠️ Row {i+1}: The AI selected 'Others'. Would you like to add a new task category instead?")
+            choice = st.radio(
+                f"Row {i+1} — What category should this task use?",
+                ["Please choose", "Keep Others", "Add new category"],
+                key=f"others_choice_{st.session_state.pending_id}_{i}",
+                horizontal=True,
+            )
+            if choice == "Add new category":
+                proposed = st.text_input(
+                    f"New category name for row {i+1}",
+                    value=suggestion or "",
+                    key=f"others_name_{st.session_state.pending_id}_{i}",
+                    help="Choose a descriptive category name. It will still require explicit approval before saving.",
+                ).strip()
+                if proposed and proposed.casefold() != "others":
+                    row["category"] = proposed
+                else:
+                    unresolved_others.append(i+1)
+            elif choice == "Please choose":
+                unresolved_others.append(i+1)
+
+        # Warn before saving, using the confirmed selection, not only the AI's guess.
+        approved_companies = db.get_companies()
+        approved_categories = db.get_categories()
+        canonical = lambda v: re.sub(r"[^a-z0-9]", "", str(v).casefold())
+        company_lookup = {canonical(c): c for c in approved_companies}
+        category_lookup = {c.casefold(): c for c in approved_categories}
+        unknown_companies = sorted({str(r.get("company")).strip() for r in current_rows
+                                    if clean(r.get("company")) and canonical(r["company"]) not in company_lookup})
+        unknown_categories = sorted({str(r.get("category")).strip() for r in current_rows
+                                     if clean(r.get("category")) and str(r["category"]).strip().casefold() not in category_lookup})
+        if unknown_companies:
+            st.warning("⚠️ New / unrecognised company names: " + "; ".join(unknown_companies) +
+                       ". Verify spelling and legal entity before choosing to add.")
+        if unknown_categories:
+            st.warning("⚠️ New / unrecognised task categories: " + "; ".join(unknown_categories) +
+                       ". Check whether an existing category fits before adding a new one.")
+        allow_companies = st.checkbox("Yes, add the unrecognised company name(s) to the Companies list", value=False,
+                                      disabled=not bool(unknown_companies), key=f"approve_companies_{st.session_state.pending_id}")
+        allow_categories = st.checkbox("Yes, add the proposed new task category/category names to Categories", value=False,
+                                       disabled=not bool(unknown_categories), key=f"approve_categories_{st.session_state.pending_id}")
+        st.caption("Approval here is by the person recording the task. It is not owner-role authentication.")
 
         col1, col2 = st.columns(2)
         if col1.button("Save to Excel", type="primary"):
@@ -212,18 +269,28 @@ with tab_chat:
                 st.error("Enter your name in the sidebar first (saved as 'uploaded by').")
             else:
                 rows = []
-                for r in edited.to_dict("records"):
+                for r in current_rows:
                     item = {k: clean(v) for k, v in r.items() if k != "fee_amount"}
+                    if item.get("company") and canonical(item["company"]) in company_lookup:
+                        item["company"] = company_lookup[canonical(item["company"])]
                     fee = r.get("fee_amount")
                     item["fee_amount"] = None if fee is None or pd.isna(fee) or str(fee).strip() == "" else fee
                     rows.append(item)
                 bad = [i + 1 for i, r in enumerate(rows)
                        if not (r.get("company") and r.get("category") and r.get("date_received"))]
-                if bad:
+                if unresolved_others:
+                    st.error(f"Please decide whether to keep 'Others' or add a new category for row(s) {unresolved_others}.")
+                elif bad:
                     st.error(f"Row(s) {bad} are missing the company, category or date received.")
+                elif unknown_companies and not allow_companies:
+                    st.error("Review and approve the new companies, or correct their names before saving.")
+                elif unknown_categories and not allow_categories:
+                    st.error("Review and approve the new categories, or use an existing category before saving.")
                 else:
                     try:
-                        saved_ids = db.insert_tasks(rows, st.session_state.pending_raw, user.strip())
+                        saved_ids = db.insert_tasks(rows, st.session_state.pending_raw, user.strip(),
+                                                    approve_new_companies=allow_companies,
+                                                    approve_new_categories=allow_categories)
                     except ValueError as e:
                         st.error(str(e))          # e.g. a date typed in the wrong format
                     except Exception as e:
